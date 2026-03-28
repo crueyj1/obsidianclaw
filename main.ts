@@ -12,6 +12,8 @@ import {
   WorkspaceLeaf,
 } from "obsidian";
 
+type NodeCryptoModule = typeof import("crypto");
+
 // ─── Settings ────────────────────────────────────────────────────────
 
 interface OpenClawSettings {
@@ -33,6 +35,17 @@ const DEFAULT_SETTINGS: OpenClawSettings = {
 
 // ─── Device Identity (Ed25519) ───────────────────────────────────────
 
+function loadNodeCrypto(): NodeCryptoModule | null {
+  if (typeof require !== "function") return null;
+  try {
+    return require("crypto") as NodeCryptoModule;
+  } catch {
+    return null;
+  }
+}
+
+const nodeCrypto = loadNodeCrypto();
+
 function toBase64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
@@ -48,6 +61,9 @@ function fromBase64Url(s: string): Uint8Array {
 }
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
+  if (nodeCrypto) {
+    return nodeCrypto.createHash("sha256").update(data).digest("hex");
+  }
   const hash = await crypto.subtle.digest("SHA-256", data.buffer);
   return Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join("");
 }
@@ -56,7 +72,7 @@ interface DeviceIdentity {
   deviceId: string;
   publicKey: string;
   privateKey: string;
-  cryptoKey: CryptoKey;
+  cryptoKey?: CryptoKey;
 }
 
 async function getOrCreateDeviceIdentity(
@@ -65,7 +81,14 @@ async function getOrCreateDeviceIdentity(
 ): Promise<DeviceIdentity> {
   const data = await loadData();
   if (data?.deviceId && data?.devicePublicKey && data?.devicePrivateKey) {
-    // Restore existing identity
+    if (nodeCrypto) {
+      return {
+        deviceId: data.deviceId,
+        publicKey: data.devicePublicKey,
+        privateKey: data.devicePrivateKey,
+      };
+    }
+
     const privBytes = fromBase64Url(data.devicePrivateKey);
     const cryptoKey = await crypto.subtle.importKey(
       "pkcs8",
@@ -82,7 +105,28 @@ async function getOrCreateDeviceIdentity(
     };
   }
 
-  // Generate new Ed25519 keypair
+  if (nodeCrypto) {
+    const keyPair = nodeCrypto.generateKeyPairSync("ed25519");
+    const publicJwk = keyPair.publicKey.export({ format: "jwk" }) as JsonWebKey;
+    if (typeof publicJwk.x !== "string") {
+      throw new Error("failed to export Ed25519 public key");
+    }
+
+    const publicKey = publicJwk.x;
+    const publicBytes = fromBase64Url(publicKey);
+    const privPkcs8 = new Uint8Array(keyPair.privateKey.export({ format: "der", type: "pkcs8" }));
+    const deviceId = await sha256Hex(publicBytes);
+    const privateKey = toBase64Url(privPkcs8);
+
+    const existing = (await loadData()) || {};
+    existing.deviceId = deviceId;
+    existing.devicePublicKey = publicKey;
+    existing.devicePrivateKey = privateKey;
+    await saveData(existing);
+
+    return { deviceId, publicKey, privateKey };
+  }
+
   const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
   const pubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", keyPair.publicKey));
   const privPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", keyPair.privateKey));
@@ -101,9 +145,18 @@ async function getOrCreateDeviceIdentity(
 }
 
 async function signDevicePayload(identity: DeviceIdentity, payload: string): Promise<string> {
+  if (nodeCrypto) {
+    const privateKey = nodeCrypto.createPrivateKey({
+      key: fromBase64Url(identity.privateKey),
+      format: "der",
+      type: "pkcs8",
+    });
+    const sig = nodeCrypto.sign(null, new TextEncoder().encode(payload), privateKey);
+    return sig.toString("base64url");
+  }
+
   const encoded = new TextEncoder().encode(payload);
   let cryptoKey = identity.cryptoKey;
-  // If cryptoKey doesn't have sign usage, re-import
   if (!cryptoKey) {
     const privBytes = fromBase64Url(identity.privateKey);
     cryptoKey = await crypto.subtle.importKey("pkcs8", privBytes, { name: "Ed25519" }, false, ["sign"]);
@@ -153,9 +206,15 @@ interface GatewayClientOpts {
 }
 
 function generateId(): string {
-  const arr = new Uint8Array(16);
-  crypto.getRandomValues(arr);
-  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
+  if (typeof crypto?.getRandomValues === "function") {
+    const arr = new Uint8Array(16);
+    crypto.getRandomValues(arr);
+    return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  if (nodeCrypto) {
+    return nodeCrypto.randomBytes(16).toString("hex");
+  }
+  throw new Error("No secure random source available");
 }
 
 class GatewayClient {
@@ -520,23 +579,60 @@ class OnboardingModal extends Modal {
     this.plugin.settings.token = token;
     await this.plugin.saveSettings();
 
+    // Modern gateways can require a signed device identity even for the initial connect.
+    let deviceIdentity: DeviceIdentity | undefined;
+    try {
+      deviceIdentity = await getOrCreateDeviceIdentity(
+        () => this.plugin.loadData(),
+        (data) => this.plugin.saveData(data)
+      );
+    } catch (e) {
+      console.warn("[ObsidianClaw] Device identity creation failed during test connection:", e);
+    }
+
     // Try to connect with a timeout
-    const testResult = await new Promise<boolean>((resolve) => {
-      const timeout = setTimeout(() => {
+    const testResult = await new Promise<{
+      ok: boolean;
+      closeInfo?: { code: number; reason: string };
+      errorMessage?: string;
+    }>((resolve) => {
+      let settled = false;
+      const finish = (result: {
+        ok: boolean;
+        closeInfo?: { code: number; reason: string };
+        errorMessage?: string;
+      }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
         testClient.stop();
-        resolve(false);
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        finish({ ok: false });
       }, 8000);
 
       const testClient = new GatewayClient({
         url,
         token: token || undefined,
-        onHello: () => {
-          clearTimeout(timeout);
-          testClient.stop();
-          resolve(true);
+        deviceIdentity,
+        onHello: async () => {
+          try {
+            await testClient.request("chat.history", {
+              sessionKey: this.plugin.settings.sessionKey || "main",
+              limit: 1,
+            });
+            finish({ ok: true });
+          } catch (error) {
+            finish({
+              ok: false,
+              errorMessage: error instanceof Error ? error.message : String(error),
+            });
+          }
         },
-        onClose: () => {
-          // Don't resolve here — let timeout handle failure
+        onClose: (info) => {
+          finish({ ok: false, closeInfo: info });
         },
       });
       testClient.start();
@@ -545,7 +641,7 @@ class OnboardingModal extends Modal {
     btn.disabled = false;
     btn.textContent = "Test connection";
 
-    if (testResult) {
+    if (testResult.ok) {
       this.showStatus("✓ Connected successfully!", "success");
       // Auto-advance after a moment
       setTimeout(() => {
@@ -553,7 +649,18 @@ class OnboardingModal extends Modal {
         this.renderStep();
       }, 1000);
     } else {
-      this.showStatus("Could not connect. Check that OpenClaw is running and the URL is correct.", "error");
+      const reason = (testResult.errorMessage || testResult.closeInfo?.reason || "").toLowerCase();
+      if (reason.includes("token mismatch") || reason.includes("token missing")) {
+        this.showStatus("Gateway token rejected. Paste the active gateway token and retry.", "error");
+      } else if (reason.includes("pairing required")) {
+        this.showStatus("Device pairing required. Approve this device in OpenClaw, then retry.", "error");
+      } else if (reason.includes("device identity required")) {
+        this.showStatus("Gateway requires device identity. Retry after the plugin saves its local device key.", "error");
+      } else if (reason.includes("missing scope")) {
+        this.showStatus("Gateway connected, but chat access was not granted. Reload Obsidian and retry.", "error");
+      } else {
+        this.showStatus("Could not connect. Check that OpenClaw is running and the URL is correct.", "error");
+      }
     }
   }
 
@@ -1160,6 +1267,8 @@ export default class OpenClawPlugin extends Plugin {
         // Show pairing instructions if needed
         if (info.reason.includes("pairing required") || info.reason.includes("device identity required")) {
           new Notice("OpenClaw: Device pairing required. Run 'openclaw devices approve' on your gateway machine.", 10000);
+        } else if (info.reason.includes("token mismatch") || info.reason.includes("token missing")) {
+          new Notice("OpenClaw: Gateway token mismatch. Update the plugin token to match your gateway.", 10000);
         }
       },
       onEvent: (evt) => {
